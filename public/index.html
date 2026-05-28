@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Same Age Gallery</title>
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#0a0a0a">
+    <link rel="icon" href="/icon.webp" type="image/webp">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/lightgallery@2.7.2/css/lightgallery-bundle.min.css">
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+    <div id="app"></div>
+    <div id="sentinel"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/lightgallery@2.7.2/lightgallery.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lightgallery@2.7.2/plugins/thumbnail/lg-thumbnail.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lightgallery@2.7.2/plugins/zoom/lg-zoom.min.js"></script>
+
+    <script>
+        const PAGE_SIZE = 20; // age groups per infinite-scroll page
+
+        // Wong colorblind-safe palette, excluding black.
+        // Assigned to people in birth-date order so the youngest gets the last colour.
+        const WONG_COLORS = ['#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2', '#D55E00', '#CC79A7'];
+
+        let people = [];
+        let personColors = new Map(); // person name → hex colour
+        let byDol = new Map();   // dol_days (number) → DOLAsset[]
+        let dolsSorted = [];     // all DOLs with photos, descending
+        let youngestPerson = null;
+        let referenceDol = 0;
+        let nextIndex = 0;
+        let isLoading = false;
+        let multiPerson = false; // true when >1 person has photos — show name badges
+
+        function colorFor(name) {
+            return personColors.get(name) || '#4a9eff';
+        }
+
+        let activeLg = null;
+        let lgClosedByPopstate = false;
+
+        window.addEventListener('popstate', () => {
+            if (activeLg) {
+                lgClosedByPopstate = true;
+                activeLg.closeGallery();
+            }
+        });
+
+        // ── Date helpers ───────────────────────────────────────────────────────
+
+        function parseDateUTC(str) {
+            const [y, m, d] = str.split('-').map(Number);
+            return new Date(Date.UTC(y, m - 1, d));
+        }
+
+        function formatDateUTC(date) {
+            return date.toLocaleDateString('en-GB', {
+                day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC'
+            });
+        }
+
+        function formatAssetDate(isoString) {
+            return formatDateUTC(parseDateUTC(isoString.substring(0, 10)));
+        }
+
+        function dolToDate(person, dol) {
+            return new Date(parseDateUTC(person.birth_date).getTime() + dol * 86400000);
+        }
+
+        function dolToAgeLabel(dol) {
+            const years = Math.floor(dol / 365);
+            const remainder = dol % 365;
+            const months = Math.floor(remainder / 30);
+            const days = remainder % 30;
+            if (years > 0) return `${years}y ${months}m`;
+            if (months > 0) return `${months}m ${days}d`;
+            return `${dol}d`;
+        }
+
+        // ── Bootstrap ──────────────────────────────────────────────────────────
+
+        async function init() {
+            document.getElementById('app').innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <p>Loading photos…</p>
+                </div>`;
+
+            let data;
+            try {
+                const res = await fetch('/api/data');
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                data = await res.json();
+            } catch (e) {
+                document.getElementById('app').innerHTML =
+                    `<div class="loading"><p>Failed to load data — please refresh.<br><small>${e.message}</small></p></div>`;
+                return;
+            }
+
+            people = (data.people || []).sort((a, b) => a.birth_date.localeCompare(b.birth_date));
+            personColors = new Map(people.map((p, i) => [p.name, WONG_COLORS[i % WONG_COLORS.length]]));
+
+            // Youngest = last in birth_date ascending sort
+            youngestPerson = people[people.length - 1];
+            if (!youngestPerson) {
+                document.getElementById('app').innerHTML =
+                    `<div class="loading"><p>No people found in data.</p></div>`;
+                return;
+            }
+
+            // Reference DOL = how many days old the youngest child is today
+            const nowUTC = Date.UTC(new Date().getFullYear(), new Date().getMonth(), new Date().getDate());
+            const birthUTC = parseDateUTC(youngestPerson.birth_date).getTime();
+            referenceDol = Math.floor((nowUTC - birthUTC) / 86400000);
+
+            // Group assets by DOL, capped at referenceDol
+            byDol = new Map();
+            const personNamesInData = new Set();
+            for (const asset of (data.assets || [])) {
+                const dol = asset.dol_days;
+                if (dol < 0 || dol > referenceDol) continue;
+                if (!byDol.has(dol)) byDol.set(dol, []);
+                byDol.get(dol).push(asset);
+                personNamesInData.add(asset.person);
+            }
+
+            multiPerson = personNamesInData.size > 1;
+
+            // Sorted DOLs descending (most recent age first)
+            dolsSorted = [...byDol.keys()].sort((a, b) => b - a);
+
+            document.getElementById('app').innerHTML = '';
+            renderNextPage();
+            setupInfiniteScroll();
+        }
+
+        // ── Rendering ──────────────────────────────────────────────────────────
+
+        function renderNextPage() {
+            if (isLoading || nextIndex >= dolsSorted.length) return;
+            isLoading = true;
+
+            const app = document.getElementById('app');
+            const end = Math.min(nextIndex + PAGE_SIZE, dolsSorted.length);
+
+            for (let i = nextIndex; i < end; i++) {
+                const dol = dolsSorted[i];
+                app.appendChild(renderAgeGroup(dol, byDol.get(dol)));
+            }
+
+            nextIndex = end;
+            isLoading = false;
+
+            if (nextIndex >= dolsSorted.length) {
+                const endDiv = document.createElement('div');
+                endDiv.className = 'end-message';
+                endDiv.textContent = `Beginning of time — ${dolsSorted.length} age groups shown.`;
+                const sentinel = document.getElementById('sentinel');
+                if (sentinel) sentinel.replaceWith(endDiv);
+            }
+        }
+
+        // Defer lightGallery init until a gallery is near the viewport.
+        // Off-screen age groups don't allocate an instance until they're scrolled toward.
+        const galleryInitObserver = new IntersectionObserver(entries => {
+            for (const entry of entries) {
+                if (entry.isIntersecting) {
+                    initLightGalleryFor(entry.target);
+                    galleryInitObserver.unobserve(entry.target);
+                }
+            }
+        }, { rootMargin: '500px' });
+
+        function initLightGalleryFor(gallery) {
+            const lgInstance = lightGallery(gallery, {
+                plugins: [lgThumbnail, lgZoom],
+                speed: 400,
+                download: false,
+                counter: true,
+                closable: true,
+                hideScrollbar: true,
+            });
+
+            gallery.addEventListener('click', (e) => {
+                if (e.target.closest('.gallery-item') && !activeLg) {
+                    activeLg = lgInstance;
+                    history.pushState({ lgOpen: true }, '', '#photo');
+                }
+            });
+
+            gallery.addEventListener('lgAfterClose', () => {
+                const wasPopstate = lgClosedByPopstate;
+                activeLg = null;
+                lgClosedByPopstate = false;
+                if (!wasPopstate) {
+                    history.back();
+                }
+            });
+        }
+
+        function renderAgeGroup(dol, assets) {
+            const section = document.createElement('div');
+            section.className = 'age-group';
+
+            // Build "Person: date" labels for people who have photos at this DOL
+            const personNamesHere = new Set(assets.map(a => a.person));
+            const dateParts = people
+                .filter(p => personNamesHere.has(p.name))
+                .map(p => {
+                    const d = dolToDate(p, dol);
+                    return `<span class="dol-person-date" style="--person-color:${colorFor(p.name)}"><strong>${escHtml(p.name)}</strong>: ${formatDateUTC(d)}</span>`;
+                }).join('');
+
+            section.innerHTML = `
+                <div class="age-group-header">
+                    <div class="dol-number">${dolToAgeLabel(dol)} <span class="dol-age">(Day ${dol})</span></div>
+                    <div class="dol-people">${dateParts}</div>
+                </div>
+            `;
+
+            const gallery = document.createElement('div');
+            gallery.className = 'gallery';
+            for (const asset of assets) {
+                gallery.appendChild(createGalleryItem(asset));
+            }
+            section.appendChild(gallery);
+
+            galleryInitObserver.observe(gallery);
+
+            return section;
+        }
+
+        function createGalleryItem(asset) {
+            const a = document.createElement('a');
+            a.className = 'gallery-item';
+            a.style.setProperty('--person-color', colorFor(asset.person));
+            a.href = `/proxy/thumbnail/${asset.asset_id}?size=preview`;
+            a.setAttribute('data-src', `/proxy/thumbnail/${asset.asset_id}?size=preview`);
+            a.setAttribute('data-sub-html',
+                `<h4>${escHtml(asset.person)}</h4><p>${formatAssetDate(asset.created)} · Day ${asset.dol_days}</p>`);
+
+            const img = document.createElement('img');
+            img.src = `/proxy/thumbnail/${asset.asset_id}`;
+            img.alt = asset.person;
+            img.loading = 'lazy';
+            a.appendChild(img);
+
+            // Always-visible name badge when there are multiple people in the gallery
+            if (multiPerson) {
+                const badge = document.createElement('div');
+                badge.className = 'person-badge';
+                badge.textContent = asset.person;
+                a.appendChild(badge);
+            }
+
+            const overlay = document.createElement('div');
+            overlay.className = 'overlay';
+            overlay.innerHTML = `
+                <div class="person-tag">${escHtml(asset.person)}</div>
+                <div class="photo-date">${formatAssetDate(asset.created)}</div>
+            `;
+            a.appendChild(overlay);
+
+            return a;
+        }
+
+        function escHtml(str) {
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+
+        // ── Infinite scroll ────────────────────────────────────────────────────
+
+        function setupInfiniteScroll() {
+            const sentinel = document.getElementById('sentinel');
+            if (!sentinel) return;
+            const observer = new IntersectionObserver(entries => {
+                if (entries[0].isIntersecting) renderNextPage();
+            }, { rootMargin: '300px' });
+            observer.observe(sentinel);
+        }
+
+        init();
+
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/sw.js');
+        }
+    </script>
+</body>
+</html>
